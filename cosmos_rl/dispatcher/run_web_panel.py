@@ -13,9 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import argparse
 import uvicorn
-import os
 import toml
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
@@ -25,7 +25,7 @@ import base64
 import cloudpickle
 
 from fastapi.responses import HTMLResponse, JSONResponse
-from typing import Dict, List, Optional, Callable, Tuple
+from typing import Dict, List, Optional, Callable, Tuple, Union
 from cosmos_rl.dispatcher.controller import Controller
 import cosmos_rl.utils.constant as constant
 from cosmos_rl.dispatcher.protocol import MESH_NAMES
@@ -43,6 +43,7 @@ from cosmos_rl.dispatcher.protocol import (
     SetProfileRequest,
     SetTracePathRequest,
     NcclErrRequest,
+    NcclStoreClearRequest,
 )
 from cosmos_rl.policy.config import Config as CosmosConfig
 import cosmos_rl.utils.util as util
@@ -61,6 +62,7 @@ from cosmos_rl.utils.api_suffix import (
     COSMOS_API_NCCL_COMM_ACCEPTOR_SUFFIX,
     COSMOS_API_NCCL_COMM_GET_ALL_SUFFIX,
     COSMOS_API_NCCL_COMM_ERROR_SUFFIX,
+    COSMOS_API_NCCL_COMM_STORE_CLEAR_SUFFIX,
     COSMOS_API_NEXT_PROMPT_SUFFIX,
     COSMOS_API_ROLLOUT_SUFFIX,
     COSMOS_API_VALIDATION_REPORT_SUFFIX,
@@ -216,11 +218,7 @@ NCCL Handshake API
 
 @app.post(COSMOS_API_NCCL_COMM_INITIATOR_SUFFIX)
 async def comm_initiator(request: HandshakeInitiatorRequest):
-    if request.unique_pair_name in controller.temp_kv_store:
-        return create_error_response(
-            constant.ErrorCode.ALREADY_EXISTS, "Unique pair name already exists"
-        )
-    elif request.handle_base64 is None or request.handle_base64 == "":
+    if request.handle_base64 is None or request.handle_base64 == "":
         return create_error_response(
             constant.ErrorCode.INVALID_REQUEST, "Handle is required"
         )
@@ -242,6 +240,15 @@ async def comm_acceptor(request: HandshakeAcceptorRequest):
 async def comm_error(request: NcclErrRequest):
     await controller.set_replica_ncclerror(request.replica_name, request.error)
     return {"message": "DetectTimeout received"}
+
+
+@app.post(COSMOS_API_NCCL_COMM_STORE_CLEAR_SUFFIX)
+async def comm_store_clear(request: NcclStoreClearRequest):
+    try:
+        await controller.clear_temp_kv_store(request.unique_pair_name)
+    except Exception as e:
+        logger.error(f"[Controller] Error clearing store: {e}")
+    return {"message": "Store cleared"}
 
 
 @app.get(COSMOS_API_NCCL_COMM_GET_ALL_SUFFIX)
@@ -464,13 +471,38 @@ def _serialize_replicas(replicas: Dict[str, Replica]) -> List[Dict]:
 
 
 def main(
-    dataset: Optional[Dataset] = None,
+    dataset: Optional[Union[Dataset, Callable[[CosmosConfig], Dataset]]] = None,
     data_packer: Optional[DataPacker] = None,
     reward_fns: Optional[List[Callable]] = None,
     val_dataset: Optional[Dataset] = None,
     val_data_packer: Optional[DataPacker] = None,
-    val_reward_fns: Optional[List[Callable]] = None,
+    **kwargs,
 ):
+    if kwargs:
+        logger.warning(
+            f"Params: {list(kwargs.keys())} are not being used in controller initialization."
+        )
+
+    # Deprecated: The following code is to ensure backward compatibility:
+    # where `dispatcher` is always launched in custom script
+    role = os.environ.get("COSMOS_ROLE")
+    assert role in ["Policy", "Rollout", "Controller"], f"Invalid role: {role}"
+    if role == "Controller":
+        pass
+    else:
+        logger.warning(
+            "Deprecated: Please update your script to use `cosmos_rl.launcher.launch()` instead of `cosmos_rl.dispatcher.run_web_panel.main`"
+        )
+        if role == "Policy":
+            from cosmos_rl.policy.train import main as policy_main
+
+            policy_main()
+        else:
+            from cosmos_rl.rollout.rollout_entrance import run_rollout
+
+            run_rollout()
+        return
+
     parser = argparse.ArgumentParser(
         description="Run the web panel for the dispatcher."
     )
@@ -534,7 +566,6 @@ def main(
             reward_fns=reward_fns,
             data_packer=data_packer,
             val_dataset=val_dataset,
-            val_reward_fns=val_reward_fns,
             val_data_packer=val_data_packer,
         )
         logger.info(f"Successfully loaded configuration from {args.config_file}")
