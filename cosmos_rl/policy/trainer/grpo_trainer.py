@@ -854,34 +854,20 @@ class GRPOTrainer(Trainer):
     @Trainer.register_policy_command_handler(DataFetchCommand)
     def execute_data_fetch(self, command: DataFetchCommand):
         logger.info("[Policy] Executing data fetch.")
-        # if command.do_profile:
-        #     self.profiler.start_dynamic(
-        #         active_steps=command.active_steps,
-        #         rank_filter=command.rank_filter,
-        #         record_shape=command.record_shape,
-        #         profile_memory=command.profile_memory,
-        #         with_stack=command.with_stack,
-        #         with_modules=command.with_modules,
-        #     )
-        if True:
-            if self.profiler.enable_profile is False:
-                logger.info("[Profiler] enable_profile is False!!")
-                self.profiler.enable_profile = True
+        if command.do_profile:
             self.profiler.start_dynamic(
-                active_steps=2,
-                rank_filter=[i for i in range(256)],
-                record_shape=True,
-                profile_memory=False,
-                with_stack=True,
-                with_modules=True,
+                active_steps=command.active_steps,
+                rank_filter=command.rank_filter,
+                record_shape=command.record_shape,
+                profile_memory=command.profile_memory,
+                with_stack=command.with_stack,
+                with_modules=command.with_modules,
             )
-            logger.info(f"Profilter step = {self.profiler.profiler.step_num}, output_dir = {self.profiler.output_dir}")
 
         assert self.replica_name == command.replica_name
         self.replica_batch_for_this_step = command.items_count
 
         is_fake_step = self.replica_batch_for_this_step == 0
-        logger.info(f"Do profile = {command.do_profile}, {is_fake_step=}")
         if not is_fake_step:
             report_data = self.train(
                 current_step=command.global_step,
