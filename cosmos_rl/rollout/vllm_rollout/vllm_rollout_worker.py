@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import time
 import torch
 import requests
 import threading
@@ -84,9 +85,10 @@ import msgpack
 Keep in mind that torch distributed is not thread safe. So try to keep the usage in the same thread.
 """
 
+PROFILE_NUM_STEPS = 3
 
 def _patch_vllm_rollout_locked_step(
-    rollout: vLLMRollout, consume_command, enable_validation
+    rollout: vLLMRollout, consume_command, enable_validation,
 ):
     llm_engine = rollout.get_engine().llm_engine
     orig_step = llm_engine.step
@@ -107,6 +109,7 @@ def _patch_vllm_rollout_locked_step(
             consume_command(
                 cmd_pred=partial(cmd_pred, enable_validation=enable_validation)
             )
+
         return orig_step(*args, **kwargs)
 
     llm_engine.step = types.MethodType(step, llm_engine)
@@ -385,6 +388,7 @@ class vLLMRolloutWorker(RolloutWorkerBase):
     @RolloutWorkerBase.register_rollout_command_handler(BuildMeshCommand)
     def build_global_mesh(self, build_mesh_command: BuildMeshCommand):
         logger.info(f"[Rollout] Building global mesh for {self.replica_name}")
+        st = time.time()
 
         replica_name_to_rank = build_mesh_command.replica_name_to_rank
         if self.replica_name not in replica_name_to_rank:
@@ -446,6 +450,8 @@ class vLLMRolloutWorker(RolloutWorkerBase):
         )
         # update the replcia_name to rank dict
         self.replica_name_to_rank = replica_name_to_rank
+        time_elapsed = time.time() - st
+        logger.info(f"Build global mesh took {time_elapsed:.3f} seconds.")
 
     def query_nccl_unique_id_from_controller(self, unique_id_key: str):
         # We don't have something like dist.barrier(), so just use while True loop to query it like synchronize.
@@ -766,6 +772,8 @@ class vLLMRolloutWorker(RolloutWorkerBase):
         Broadcast the weight to all other rollout replicas.
         Will only happen between Rollout Replica 0 and all other Rollout Replicas.
         """
+        logger.info("[Rollout] broadcast to all rollout replica command called")
+        st = time.time()
         src_replica_name: str = broadcast_command.src_replica_name
         dst_replica_names: List[str] = broadcast_command.dst_replica_names
 
@@ -785,6 +793,7 @@ class vLLMRolloutWorker(RolloutWorkerBase):
                 )
                 self.prepare_shard_infos_for_weight_sync_insts()
 
+        broadcast_bytes = 0
         if len(dst_replica_names) > 1:
             logger.info("Starting broadcasting of parameters to all replicas.")
             # Only do broadcast if there are more than one rollout replicas.
@@ -799,6 +808,8 @@ class vLLMRolloutWorker(RolloutWorkerBase):
                 src_rank = self.replica_name_to_rank[src_replica_name]
 
                 for parameter in self.get_underlying_model().state_dict().values():
+                    parameter_size = parameter.numel() * parameter.element_size()
+                    broadcast_bytes += parameter_size
                     recv_tensor = parameter
                     if not parameter.is_contiguous():
                         recv_tensor = parameter.contiguous()
@@ -875,6 +886,8 @@ class vLLMRolloutWorker(RolloutWorkerBase):
                             f"[Rollout] Failed in post rollout completion to controller: {str(e)}"
                         )
 
+        time_elapsed = time.time() - st
+        logger.info(f"Rollout R to R broadcast took {time_elapsed:.3f} seconds with {broadcast_bytes / (1024 * 1024)} MBs")
         if broadcast_command.replica_should_stop():
             self.shutdown_signal.set()
 
