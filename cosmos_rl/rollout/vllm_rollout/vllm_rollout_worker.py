@@ -88,7 +88,7 @@ Keep in mind that torch distributed is not thread safe. So try to keep the usage
 PROFILE_NUM_STEPS = 3
 
 def _patch_vllm_rollout_locked_step(
-    rollout: vLLMRollout, consume_command, enable_validation,
+    rollout: vLLMRollout, consume_command, enable_validation, profiler, trace_file,
 ):
     llm_engine = rollout.get_engine().llm_engine
     orig_step = llm_engine.step
@@ -99,6 +99,11 @@ def _patch_vllm_rollout_locked_step(
         return True
 
     def step(self, *args, **kwargs):
+        if trace_file is not None and os.path.exists(trace_file) == False:
+            if profiler.step_num == 0:
+                logger.info("Start the profiler")
+                profiler.start()
+
         if not hasattr(self, "_cosmos_step_counter"):
             self._cosmos_step_counter = 0
         self._cosmos_step_counter += 1
@@ -110,7 +115,17 @@ def _patch_vllm_rollout_locked_step(
                 cmd_pred=partial(cmd_pred, enable_validation=enable_validation)
             )
 
-        return orig_step(*args, **kwargs)
+        output_values =  orig_step(*args, **kwargs)
+
+        if trace_file is not None and os.path.exists(trace_file) == False:
+            profiler.step()
+            logger.info(f"Increment the profiler step : {profiler.step_num}")
+            if profiler.step_num == PROFILE_NUM_STEPS:
+                profiler.stop()
+                logger.info("Stop the profiler")
+                profiler.export_chrome_trace(trace_file)
+
+        return output_values
 
     llm_engine.step = types.MethodType(step, llm_engine)
 
@@ -155,6 +170,26 @@ class vLLMRolloutWorker(RolloutWorkerBase):
 
     def __init__(self, config: CosmosConfig, parallel_dims: ParallelDims) -> None:
         super(vLLMRolloutWorker, self).__init__(config, parallel_dims)
+
+        # Initialize the profiler
+        rank = torch.distributed.get_rank()
+        slurm_rank_id = os.environ["SLURM_PROCID"]
+        trace_dir = os.environ["TORCH_PROFILER_DIR"]
+        if rank == 0:
+            self.trace_file = os.path.join(trace_dir, f"slurm{slurm_rank_id}_rank{rank}_trace.json.gz")
+        else:
+            self.trace_file = None
+        self.profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(wait=0, warmup=0, active=PROFILE_NUM_STEPS, repeat=1),
+            record_shapes=True,
+            with_stack=True,
+            with_modules=True,
+        )
+
         self.state = self.State()
         self.config = config
         if self.config.rollout.parallelism.dp_shard_size == -1:
@@ -622,6 +657,8 @@ class vLLMRolloutWorker(RolloutWorkerBase):
                 self.rollout,
                 self.consume_command,
                 self.config.train.enable_validation,
+                self.profiler,
+                self.trace_file,
             )
             self.prepare_shard_infos_for_weight_sync_insts()
 
@@ -790,6 +827,8 @@ class vLLMRolloutWorker(RolloutWorkerBase):
                     self.rollout,
                     self.consume_command,
                     self.config.train.enable_validation,
+                    self.profiler,
+                    self.trace_file,
                 )
                 self.prepare_shard_infos_for_weight_sync_insts()
 
