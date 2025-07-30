@@ -153,7 +153,7 @@ class vLLMRollout(RolloutBase):
                 enable_expert_parallel=enable_ep_parallelism,
                 distributed_executor_backend="external_launcher",
                 dtype="auto",
-                enforce_eager=self.rollout_config.enforce_eager,  # enable cuda graph
+                enforce_eager=False,  # self.rollout_config.enforce_eager,  # enable cuda graph
                 gpu_memory_utilization=self.rollout_config.gpu_memory_utilization,
                 disable_custom_all_reduce=True,
                 disable_mm_preprocessor_cache=disable_mm_preprocessor_cache,

@@ -177,6 +177,9 @@ class vLLMRolloutWorker(RolloutWorkerBase):
                 )
             else:
                 os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+                logger.info(
+                    "Was thinking of using FLASHINFER for attention backend. but wont"
+                )
 
         if self.config.rollout.sampling_config.use_flashinfer:
             try:
@@ -188,6 +191,7 @@ class vLLMRolloutWorker(RolloutWorkerBase):
             else:
                 os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
 
+        os.environ["VLLM_ATTENTION_BACKEND"] = "CUTLASS_MLA_VLLM_V1"
         os.environ["VLLM_LOGGING_LEVEL"] = "INFO"
 
         # determine the quantization type
