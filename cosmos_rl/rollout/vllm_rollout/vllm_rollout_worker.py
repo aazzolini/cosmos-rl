@@ -85,13 +85,16 @@ import msgpack
 Keep in mind that torch distributed is not thread safe. So try to keep the usage in the same thread.
 """
 
-PROFILE_NUM_STEPS = 3
+PROFILE_WAIT_STEPS = 60
+PROFILE_WARMUP_STEPS = 1
+PROFILE_ACTIVE_STEPS = 5
 
 def _patch_vllm_rollout_locked_step(
     rollout: vLLMRollout, consume_command, enable_validation, profiler, trace_file,
 ):
     llm_engine = rollout.get_engine().llm_engine
     orig_step = llm_engine.step
+    expected_total_steps = PROFILE_WAIT_STEPS + PROFILE_WARMUP_STEPS + PROFILE_ACTIVE_STEPS
 
     def cmd_pred(cmd: Command, enable_validation: bool):
         if enable_validation and isinstance(cmd, RolloutToRolloutBroadcastCommand):
@@ -99,7 +102,7 @@ def _patch_vllm_rollout_locked_step(
         return True
 
     def step(self, *args, **kwargs):
-        if trace_file is not None and os.path.exists(trace_file) == False:
+        if os.path.exists(trace_file) == False:
             if profiler.step_num == 0:
                 logger.info("Start the profiler")
                 profiler.start()
@@ -117,10 +120,10 @@ def _patch_vllm_rollout_locked_step(
 
         output_values =  orig_step(*args, **kwargs)
 
-        if trace_file is not None and os.path.exists(trace_file) == False:
+        if os.path.exists(trace_file) == False:
             profiler.step()
             logger.info(f"Increment the profiler step : {profiler.step_num}")
-            if profiler.step_num == PROFILE_NUM_STEPS:
+            if profiler.step_num == expected_total_steps:
                 profiler.stop()
                 logger.info("Stop the profiler")
                 profiler.export_chrome_trace(trace_file)
@@ -174,17 +177,18 @@ class vLLMRolloutWorker(RolloutWorkerBase):
         # Initialize the profiler
         rank = torch.distributed.get_rank()
         slurm_rank_id = os.environ["SLURM_PROCID"]
+        slurm_job_id = os.environ["SLURM_JOB_ID"]
         trace_dir = os.environ["TORCH_PROFILER_DIR"]
         if rank == 0:
-            self.trace_file = os.path.join(trace_dir, f"slurm{slurm_rank_id}_rank{rank}_trace.json.gz")
+            self.trace_file = os.path.join(trace_dir, f"job_{slurm_job_id}_slurm{slurm_rank_id}_rank{rank}_trace.json.gz")
         else:
-            self.trace_file = None
+            self.trace_file = ""
         self.profiler = torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            schedule=torch.profiler.schedule(wait=0, warmup=0, active=PROFILE_NUM_STEPS, repeat=1),
+            schedule=torch.profiler.schedule(wait=PROFILE_WAIT_STEPS, warmup=PROFILE_WARMUP_STEPS, active=PROFILE_ACTIVE_STEPS, repeat=1),
             record_shapes=True,
             with_stack=True,
             with_modules=True,
