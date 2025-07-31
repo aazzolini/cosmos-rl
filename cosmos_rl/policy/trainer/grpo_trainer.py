@@ -859,28 +859,28 @@ class GRPOTrainer(Trainer):
     def execute_data_fetch(self, command: DataFetchCommand):
         logger.info("[Policy] Executing data fetch.")
         logger.info("Received a Data Fetch command")
-        if command.do_profile:
-            self.profiler.start_dynamic(
-                active_steps=command.active_steps,
-                rank_filter=command.rank_filter,
-                record_shape=command.record_shape,
-                profile_memory=command.profile_memory,
-                with_stack=command.with_stack,
-                with_modules=command.with_modules,
-            )
-        # if True:
-        #     if self.profiler.enable_profile is False:
-        #         logger.info("[Profiler] enable_profile is False!!")
-        #         self.profiler.enable_profile = True
+        # if command.do_profile:
         #     self.profiler.start_dynamic(
-        #         active_steps=1,
-        #         rank_filter=[i for i in range(256)],
-        #         record_shape=True,
-        #         profile_memory=False,
-        #         with_stack=True,
-        #         with_modules=True,
+        #         active_steps=command.active_steps,
+        #         rank_filter=command.rank_filter,
+        #         record_shape=command.record_shape,
+        #         profile_memory=command.profile_memory,
+        #         with_stack=command.with_stack,
+        #         with_modules=command.with_modules,
         #     )
-        #     logger.info(f"Profilter step = {self.profiler.profiler.step_num}, output_dir = {self.profiler.output_dir}")
+        if True:
+            if self.profiler.enable_profile is False:
+                logger.info("[Profiler] enable_profile is False!!")
+                self.profiler.enable_profile = True
+            self.profiler.start_dynamic(
+                active_steps=1,
+                rank_filter=[i for i in range(256)],
+                record_shape=True,
+                profile_memory=False,
+                with_stack=True,
+                with_modules=True,
+            )
+            logger.info(f"Profilter step = {self.profiler.profiler.step_num}, output_dir = {self.profiler.output_dir}")
 
         assert self.replica_name == command.replica_name
         self.replica_batch_for_this_step = command.items_count
