@@ -14,6 +14,7 @@ ARG EFA_INSTALLER_VERSION=1.42.0
 ARG AWS_OFI_NCCL_VERSION=v1.16.0
 # NCCL version, should be found at https://developer.download.nvidia.cn/compute/cuda/repos/ubuntu2204/x86_64/
 ARG NCCL_VERSION=2.26.2-1+cuda12.8
+ARG PYTHON_VERSION=3.12
 
 ENV TZ=Etc/UTC
 
@@ -59,24 +60,29 @@ RUN apt-get update -qq && \
     DEBIAN_FRONTEND=noninteractive apt-get install -qq -y redis-server
 
 ###################################################
+RUN apt-get install -qq -y software-properties-common
+RUN add-apt-repository ppa:deadsnakes/ppa
 ## Install python
 RUN apt-get update -qq && \
     DEBIAN_FRONTEND=noninteractive apt-get install -qq -y --allow-change-held-packages \
-    python3.10 python3.10-dev python3.10-venv python3-pip python-is-python3
+    python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv
+## Create a virtual environment
+RUN python${PYTHON_VERSION} -m venv /opt/venv/cosmos_rl
+ENV PATH="/opt/venv/cosmos_rl/bin:$PATH"
 
 RUN pip install -U pip setuptools wheel packaging
 # even though we don't depend on torchaudio, vllm does. in order to
 # make sure the cuda version matches, we install it here.
-RUN pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+RUN pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
 
 COPY requirements.txt /workspace/cosmos_rl/requirements.txt
+
 RUN pip install \
-    torchao==0.11.0 \
-    vllm==0.9.1 \
-    flash-attn==2.8.0.post2 \
+    torchao==0.12.0 \
+    vllm==0.10.0 \
+    flash-attn==2.8.2 \
     https://download.pytorch.org/whl/cu128/flashinfer/flashinfer_python-0.2.6.post1%2Bcu128torch2.7-cp39-abi3-linux_x86_64.whl \
     -r /workspace/cosmos_rl/requirements.txt
-
 
 ###################################################
 FROM no-efa-base AS efa-base

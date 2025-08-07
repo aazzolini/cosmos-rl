@@ -110,6 +110,7 @@ class Controller:
             )
 
         self.config = config
+        self.prompt_fetch_count = 0
         task_type = config.train.train_policy.type
         self.tokenizer = util.retry(AutoTokenizer.from_pretrained)(
             config.policy.model_name_or_path,
@@ -183,7 +184,7 @@ class Controller:
                 val_dataloader = DataLoader(
                     self.val_dataset.val_set,
                     batch_size=1,  # batch size is 1 is mandatory
-                    shuffle=config.train.train_policy.dataloader_shuffle,
+                    shuffle=False,
                     num_workers=config.train.train_policy.dataloader_num_workers,
                     prefetch_factor=config.train.train_policy.dataloader_prefetch_factor,
                     collate_fn=RLPayload.collate_fn,
@@ -448,6 +449,34 @@ class Controller:
             idx = idx.item() if isinstance(idx, torch.Tensor) else idx
             prompt_id_and_payload_list.append((idx, payload))
 
+        current_fetch_count = len(prompt_id_and_payload_list)
+        if (
+            (not is_validation)
+            and self.config.train.train_policy.on_policy
+            and len(self.rollout_status_manager.replica_scaling_log) == 0
+        ):
+            # Fully Synchronized mode is enabled, we need to tag the prompt with specific weight-version
+            weight_versions = []
+            global_batch_size = (
+                self.config.train.train_batch_per_replica
+                * len(self.policy_status_manager)
+                // self.config.rollout.n_generation
+            )
+            for i in range(current_fetch_count):
+                weight_versions.append(
+                    (self.prompt_fetch_count + i) // global_batch_size
+                )
+            # logger.info(f"[Controller] Fully Synchronized mode is enabled, weight_versions: {weight_versions}, train_batch_per_replica: {self.config.train.train_batch_per_replica}, policy_replicas: {len(self.policy_status_manager)}, prompt_fetch_count: {self.prompt_fetch_count}")
+            self.prompt_fetch_count += current_fetch_count
+        else:
+            weight_versions = [0] * current_fetch_count
+
+        prompt_id_and_payload_list = [
+            (idx, payload, weight_version)
+            for (idx, payload), weight_version in zip(
+                prompt_id_and_payload_list, weight_versions
+            )
+        ]
         return prompt_id_and_payload_list, is_end
 
     def query_reference_answer(

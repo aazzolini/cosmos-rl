@@ -279,6 +279,11 @@ class GrpoConfig(BaseModel):
         "lower-bound specified in argument `epsilon`. Paper DAPO recommends `0.28`.",
     )
 
+    positive_nll_coef: Optional[float] = Field(
+        default=None,
+        description="Coefficient for Positive Example LM Loss. Set a positive value to enable; None disables the feature.",
+    )
+
     lower_bound_ratio: float = Field(
         default=3.0,
         description="Lower-bound ratio for dual-clip.",
@@ -333,6 +338,11 @@ class GrpoConfig(BaseModel):
         description="Allowed outdated-async steps for rollout engine. "
         "If the number of left pending rollouts is larger than the `allowed_outdated_steps * n_policy_replicas * train_batch_per_replica`, "
         "then rollout engine traffic will be throttled. ",
+    )
+
+    on_policy: bool = Field(
+        default=False,
+        description="Enable fully synchronized (on-policy) rollout. If set to True, the rollout engine will wait until the expected weight version is updated before next generation starts.",
     )
 
     min_filter_prefix_tokens: Optional[int] = Field(
@@ -456,9 +466,14 @@ class TrainingConfig(BaseModel):
 
     compile: bool = Field(default=True, description="Whether to use torch.compile")
 
+    master_dtype: Optional[str] = Field(
+        default="float32",
+        description="The master weight data type for optimizers, is orthognal to `param_dtype`.",
+        choices=["bfloat16", "float16", "float32"],
+    )
     param_dtype: str = Field(
         default="bfloat16",
-        description="The data type for parameters and activations",
+        description="The data type for forward/backward. Outside forward/backward, params are in `master_dtype`",
         choices=["bfloat16", "float16", "float32"],
     )
 
@@ -509,6 +524,13 @@ class TrainingConfig(BaseModel):
             )
         if self.max_num_steps is not None and self.max_num_steps <= 0:
             raise ValueError("max_num_steps must be positive if specified")
+
+        if isinstance(self.train_policy, GrpoConfig):
+            if self.train_policy.on_policy:
+                assert (
+                    self.sync_weight_interval == 1
+                ), "sync_weight_interval must be 1 when on_policy is enabled"
+
         return self
 
 
@@ -519,6 +541,7 @@ class ParallelismConfig(BaseModel):
     )
     tp_size: int = Field(default=2, description="Tensor parallelism size")
     cp_size: int = Field(default=1, description="Context parallelism size")
+    ep_size: int = Field(default=1, description="Expert parallelism size")
     dp_shard_size: int = Field(
         default=-1, description="Data Parallelism size in sharded mode"
     )
@@ -554,6 +577,10 @@ class PolicyConfig(BaseModel):
         default="Qwen/Qwen2.5-VL-7B-Instruct",
         description="The model name or path, compatible with huggingface model name or local path",
     )
+    model_revision: Optional[str] = Field(
+        default=None,
+        description="The revision of the model to use",
+    )
     model_max_length: int = Field(
         default=4096,
         description="The maximum length for training, longer than this will be ignored for training stability",
@@ -568,6 +595,7 @@ class PolicyConfig(BaseModel):
             self.model_name_or_path is not None and self.model_name_or_path != ""
         ), "model_name_or_path is required"
         assert self.parallelism.tp_size > 0, "tp_size must be greater than 0"
+        assert self.parallelism.ep_size > 0, "ep_size must be greater than 0"
         assert self.parallelism.cp_size > 0, "cp_size must be greater than 0"
         assert self.parallelism.pp_size > 0, "pp_size must be greater than 0"
         assert (
@@ -614,12 +642,14 @@ class ValidationConfig(BaseModel):
     )
 
     temperature: float = Field(
-        default=0.9, description="Temperature for sampling during validation."
+        default=0.0, description="Temperature for sampling during validation."
     )
-    top_p: float = Field(
-        default=1.0, description="Top-p for sampling during validation."
+    top_p: Optional[float] = Field(
+        default=None, description="Top-p for sampling during validation."
     )
-    top_k: int = Field(default=10, description="Top-k for sampling during validation.")
+    top_k: Optional[int] = Field(
+        default=1, description="Top-k for sampling during validation."
+    )
     repetition_penalty: float = Field(
         default=1.0, description="Repetition penalty for sampling during validation."
     )
@@ -627,8 +657,8 @@ class ValidationConfig(BaseModel):
         default=1,
         description="n parameter same like what in OpenAI chat API for validation.",
     )
-    max_response_length: int = Field(
-        default=2048,
+    max_response_length: Optional[int] = Field(
+        default=None,
         description="Max output length of rollout generation during validation.",
     )
     reward_function: Union[str, List[str], Dict[str, float]] = Field(
@@ -726,6 +756,9 @@ class LoggingConfig(BaseModel):
 
 
 class Config(BaseModel):
+    custom: Dict[str, Any] = Field(
+        default_factory=dict, description="Custom script configuration."
+    )
     train: TrainingConfig = Field(default_factory=TrainingConfig)
     rollout: RolloutConfig = Field(default_factory=RolloutConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)

@@ -36,6 +36,36 @@ import numpy as np
 from tqdm import tqdm
 
 
+class ReplicaScalingEnum(StrEnum):
+    """
+    Enum for replica scaling event.
+    """
+
+    REPLICA_SCALING_UP = "replica_scaling_up"
+    REPLICA_SCALING_DOWN = "replica_scaling_down"
+
+
+class ReplicaScalingLog:
+    event: ReplicaScalingEnum
+    replica_name: str
+    timestamp: int
+
+    def __init__(
+        self, event: ReplicaScalingEnum, replica_name: str, timestamp: int = None
+    ):
+        self.event = event
+        self.replica_name = replica_name
+        self.timestamp = timestamp if timestamp is not None else int(time.time())
+
+    @staticmethod
+    def up(replica: Replica):
+        return ReplicaScalingLog(ReplicaScalingEnum.REPLICA_SCALING_UP, replica.name)
+
+    @staticmethod
+    def down(replica: Replica):
+        return ReplicaScalingLog(ReplicaScalingEnum.REPLICA_SCALING_DOWN, replica.name)
+
+
 class PolicyStatus(StrEnum):
     """
     Enum for policy status.
@@ -61,6 +91,7 @@ class PolicyStatusManager:
 
     policy_replicas: Dict[str, Replica]
     policy_init_done: bool = False
+    replica_scaling_log: List[ReplicaScalingLog]
 
     # Global status
     remain_samples_num: int
@@ -78,6 +109,7 @@ class PolicyStatusManager:
         self.remain_samples_num = 0
         self.status = {}
         self.train_report_data = RollingDict(maxlen=20)
+        self.replica_scaling_log = []
 
         # Validation
         self.val_iters: Dict[int, Iterator] = {}
@@ -277,6 +309,7 @@ class PolicyStatusManager:
 
         replica = self.policy_replicas.pop(replica_name)
         self.status.pop(replica_name)
+        self.replica_scaling_log.append(ReplicaScalingLog.down(replica))
 
         if self.training_finished():
             # This policy replica is normally finished
@@ -518,18 +551,11 @@ class PolicyStatusManager:
             self.val_report_data[validation_step] = []
 
         self.val_report_data[validation_step].extend(validation_results)
-        num_rollout_replicas = len(
-            rollout_status_manager.get_all_atoms_arrived_replicas()
-        )
         n_items_of_this_step = sum(
             len(x) for x in self.val_report_data[validation_step]
         )
-        validation_finished = (
-            len(self.val_report_data[validation_step]) == num_rollout_replicas
-        )
-        validation_finished = validation_finished or n_items_of_this_step == len(
-            self.val_dataloader
-        )
+
+        validation_finished = n_items_of_this_step == len(self.val_dataloader)
 
         if self.activated_val_tqdm:
             self.activated_val_tqdm.update(n_items_of_this_step)
@@ -537,7 +563,7 @@ class PolicyStatusManager:
             logger.error("[Controller] Validation tqdm is not activated")
 
         # Check if all rollout replicas have reported validation results
-        if validation_finished:
+        if validation_finished and self.activated_val_iter is not None:
             # Validation is finished, trigger next step training
             self.activated_val_iter = None
             self.activated_val_tqdm.clear()
@@ -655,6 +681,25 @@ class PolicyStatusManager:
                     total_iter_time_avg = np.mean(
                         [data["train/iteration_time"] for data in self.report_data_list]
                     )
+                    # KL loss
+                    total_kl_loss_avg = np.mean(
+                        [
+                            data.get("train/kl_loss_avg", 0)
+                            for data in self.report_data_list
+                        ]
+                    )
+                    total_kl_loss_max = np.max(
+                        [
+                            data.get("train/kl_loss_max", 0)
+                            for data in self.report_data_list
+                        ]
+                    )
+                    total_grad_norm = np.mean(
+                        [
+                            data.get("train/grad_norm", 0)
+                            for data in self.report_data_list
+                        ]
+                    )
                     train_step = self.report_data_list[0]["train_step"]
                     self.report_data_list = []
 
@@ -663,6 +708,9 @@ class PolicyStatusManager:
                         "train/loss_max": total_loss_max,
                         "train/learning_rate": total_learning_rate,
                         "train/iteration_time": total_iter_time_avg,
+                        "train/kl_loss_avg": total_kl_loss_avg,
+                        "train/kl_loss_max": total_kl_loss_max,
+                        "train/grad_norm": total_grad_norm,
                     }
 
                     self.train_report_data.setdefault(train_step, {}).update(
@@ -825,10 +873,12 @@ class RolloutStatusManager:
 
     rollout_replicas: Dict[str, Replica]
     rollout_init_done: bool
+    replica_scaling_log: List[ReplicaScalingLog]
 
     def __init__(self):
         self.rollout_replicas = {}
         self.rollout_init_done = False
+        self.replica_scaling_log = []
 
     def setup(
         self,
@@ -921,6 +971,7 @@ class RolloutStatusManager:
         ), f"Replica {replica_name} not found in policy status manager"
 
         replica = self.rollout_replicas.pop(replica_name)
+        self.replica_scaling_log.append(ReplicaScalingLog.down(replica))
         if policy_status_manager.training_finished():
             # This policy replica is normally finished
             # Do not trigger rebuild mesh since everything is gonna be finished shortly

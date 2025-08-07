@@ -271,6 +271,16 @@ class Attention(nn.Module):
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
+        input_dtype = xq.dtype
+        if input_dtype == torch.float32:
+            if torch.is_autocast_enabled():
+                target_dtype = torch.get_autocast_gpu_dtype()
+            else:
+                raise ValueError("Flash attention only supports float32 input")
+            xq = xq.to(target_dtype)
+            xk = xk.to(target_dtype)
+            xv = xv.to(target_dtype)
+
         output = self.attn_func(xq, xk, xv, causal=True)
         # output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
         # output = output.transpose(
@@ -654,6 +664,7 @@ class Qwen3MoE(BaseModel):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor = None,
+        interested_tokens: Optional[torch.BoolTensor] = None,
         *args,
         **kwargs,
     ):
@@ -671,6 +682,11 @@ class Qwen3MoE(BaseModel):
 
         # Add `if` check just in case `pp` is enabled
         if self.norm is not None:
+            if interested_tokens is not None:
+                assert not isinstance(
+                    h, torch.distributed.tensor.DTensor
+                ), "interested_tokens must be a local tensor"
+                h = h[interested_tokens]
             h = self.norm(h)
             if not self.tie_embed_tokens:
                 output = self.lm_head(h)
@@ -771,6 +787,7 @@ class Qwen3MoE(BaseModel):
         model_name_or_path: str,
         parallel_dims: ParallelDims,
         device: torch.device,
+        revision: Optional[str] = None,
     ):
         """
         Load weights from a HuggingFace model.
@@ -782,7 +799,7 @@ class Qwen3MoE(BaseModel):
         """
         # Load all safetensors from `model_path`
         model_type = retry(AutoConfig.from_pretrained)(model_name_or_path).model_type
-        model_path = resolve_model_path(model_name_or_path)
+        model_path = resolve_model_path(model_name_or_path, revision=revision)
         safetensors_files = [
             f for f in os.listdir(model_path) if f.endswith(".safetensors")
         ]
