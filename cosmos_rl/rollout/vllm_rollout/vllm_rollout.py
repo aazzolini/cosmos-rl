@@ -17,6 +17,7 @@ import os
 from cosmos_rl.rollout.vllm_rollout.monkey_patch_for_fp8 import apply_fp8_linear_patch
 
 import vllm
+from vllm.config import CompilationConfig, CompilationLevel
 import torch
 from typing import List, Tuple, Any, Optional
 from transformers import AutoTokenizer, AutoConfig
@@ -177,6 +178,11 @@ class vLLMRollout(RolloutBase):
                 # seems like not supported
                 # kv_cache_dtype="fp8",
                 # calculate_kv_scales=True,
+                compilation_config=CompilationConfig(
+                    level=CompilationLevel.PIECEWISE,
+                    # By default, it goes up to max_num_seqs
+                    cudagraph_capture_sizes=[1, 2, 4, 8, 16, 32],
+                ),
             )
             self._engine_initialized = True
             logger.info("[Rollout] Engine initialized.")
@@ -232,12 +238,14 @@ class vLLMRollout(RolloutBase):
 
         stream = torch.cuda.current_stream() if stream is None else stream
         try:
+            logger.info("Start rollout generation")
             with torch.cuda.stream(stream):
                 results = self.rollout_engine.generate(
                     prompts=prompts,
                     sampling_params=sampling_params,
                     use_tqdm=False,
                 )
+            logger.info("Finished rollout generation")
 
             for idx, output in enumerate(results):
                 repo = [output.outputs[i].text for i in range(len(output.outputs))]

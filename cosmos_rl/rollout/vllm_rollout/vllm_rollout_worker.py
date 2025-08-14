@@ -87,7 +87,7 @@ Keep in mind that torch distributed is not thread safe. So try to keep the usage
 
 PROFILE_WAIT_STEPS = 60
 PROFILE_WARMUP_STEPS = 1
-PROFILE_ACTIVE_STEPS = 5
+PROFILE_ACTIVE_STEPS = 10
 
 def _patch_vllm_rollout_locked_step(
     rollout: vLLMRollout, consume_command, enable_validation, profiler, trace_file,
@@ -121,8 +121,10 @@ def _patch_vllm_rollout_locked_step(
         output_values =  orig_step(*args, **kwargs)
 
         if os.path.exists(trace_file) == False:
+            rank = torch.distributed.get_rank()
             profiler.step()
-            logger.info(f"Increment the profiler step : {profiler.step_num}")
+            if profiler.step_num % 100 == 0 and rank == 1:
+                logger.info(f"Increment the profiler step : {profiler.step_num}")
             if profiler.step_num == expected_total_steps:
                 profiler.stop()
                 logger.info("Stop the profiler")
@@ -754,7 +756,7 @@ class vLLMRolloutWorker(RolloutWorkerBase):
                 recv_ready.record()
                 with torch.cuda.stream(copy_stream):
                     recv_ready.wait()
-                    logger.debug(
+                    logger.info(
                         f"Flushing {len(pending_completions)} completions, {pending_bytes[0] // 1024 // 1024}"
                     )
                     for completion in pending_completions:
@@ -765,9 +767,11 @@ class vLLMRolloutWorker(RolloutWorkerBase):
             nccl_group_start(communicator_index)
 
             TRANSFER_GROUP_SIZE = 4
+            insts_group_id = 0
             for insts_group in self.policy_to_rollout_recv_insts:
                 # insts_group: WeightSyncInstructionsGroup -> inst collection for a full weight tensor
                 # handle inst group
+                logger.info(f"Number of insts groups = {len(self.policy_to_rollout_recv_insts)}, starts group: {insts_group_id}")
                 bytes_received, completion_fn = self.recv_weight_shard(
                     self.global_rank,
                     insts_group,
@@ -778,9 +782,13 @@ class vLLMRolloutWorker(RolloutWorkerBase):
                 pending_completions.append(completion_fn)
                 total_bytes_received += bytes_received
 
+                logger.info(f"Number of insts groups = {len(self.policy_to_rollout_recv_insts)}, ends group: {insts_group_id}, {bytes_received=}")
+                insts_group_id += 1
+
                 pending_groups += 1
                 if pending_groups == TRANSFER_GROUP_SIZE:
                     nccl_group_end(communicator_index)
+                    logger.info(f"Waiting for flush completions for group {insts_group_id}")
                     flush_completions(pending_bytes, pending_completions)
                     nccl_group_start(communicator_index)
                     pending_groups = 0
@@ -857,7 +865,7 @@ class vLLMRolloutWorker(RolloutWorkerBase):
                     if not parameter.is_contiguous():
                         recv_tensor = parameter.contiguous()
 
-                    nccl_broadcast(recv_tensor, src_rank, self.global_commnicator_idex)
+                    nccl_broadcast(recv_tensor, src_rank, self.global_commnicator_idex, timeout_ms=1200000)
 
                     if not parameter.is_contiguous():
                         parameter.copy_(recv_tensor)
