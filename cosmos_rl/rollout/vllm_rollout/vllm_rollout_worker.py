@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import time
 import torch
 import requests
 import threading
@@ -84,12 +85,16 @@ import msgpack
 Keep in mind that torch distributed is not thread safe. So try to keep the usage in the same thread.
 """
 
+PROFILE_WAIT_STEPS = 60
+PROFILE_WARMUP_STEPS = 1
+PROFILE_ACTIVE_STEPS = 10
 
 def _patch_vllm_rollout_locked_step(
-    rollout: vLLMRollout, consume_command, enable_validation
+    rollout: vLLMRollout, consume_command, enable_validation, profiler, trace_file,
 ):
     llm_engine = rollout.get_engine().llm_engine
     orig_step = llm_engine.step
+    expected_total_steps = PROFILE_WAIT_STEPS + PROFILE_WARMUP_STEPS + PROFILE_ACTIVE_STEPS
 
     def cmd_pred(cmd: Command, enable_validation: bool):
         if enable_validation and isinstance(cmd, RolloutToRolloutBroadcastCommand):
@@ -97,6 +102,11 @@ def _patch_vllm_rollout_locked_step(
         return True
 
     def step(self, *args, **kwargs):
+        if os.path.exists(trace_file) == False:
+            if profiler.step_num == 0:
+                logger.info("Start the profiler")
+                profiler.start()
+
         if not hasattr(self, "_cosmos_step_counter"):
             self._cosmos_step_counter = 0
         self._cosmos_step_counter += 1
@@ -107,7 +117,20 @@ def _patch_vllm_rollout_locked_step(
             consume_command(
                 cmd_pred=partial(cmd_pred, enable_validation=enable_validation)
             )
-        return orig_step(*args, **kwargs)
+
+        output_values =  orig_step(*args, **kwargs)
+
+        if os.path.exists(trace_file) == False:
+            rank = torch.distributed.get_rank()
+            profiler.step()
+            if profiler.step_num % 100 == 0 and rank == 1:
+                logger.info(f"Increment the profiler step : {profiler.step_num}")
+            if profiler.step_num == expected_total_steps:
+                profiler.stop()
+                logger.info("Stop the profiler")
+                profiler.export_chrome_trace(trace_file)
+
+        return output_values
 
     llm_engine.step = types.MethodType(step, llm_engine)
 
@@ -152,6 +175,27 @@ class vLLMRolloutWorker(RolloutWorkerBase):
 
     def __init__(self, config: CosmosConfig, parallel_dims: ParallelDims) -> None:
         super(vLLMRolloutWorker, self).__init__(config, parallel_dims)
+
+        # Initialize the profiler
+        rank = torch.distributed.get_rank()
+        slurm_rank_id = os.environ["SLURM_PROCID"]
+        slurm_job_id = os.environ["SLURM_JOB_ID"]
+        trace_dir = os.environ["TORCH_PROFILER_DIR"]
+        if rank == 0:
+            self.trace_file = os.path.join(trace_dir, f"job_{slurm_job_id}_slurm{slurm_rank_id}_rank{rank}_trace.json.gz")
+        else:
+            self.trace_file = ""
+        self.profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(wait=PROFILE_WAIT_STEPS, warmup=PROFILE_WARMUP_STEPS, active=PROFILE_ACTIVE_STEPS, repeat=1),
+            record_shapes=True,
+            with_stack=True,
+            with_modules=True,
+        )
+
         self.state = self.State()
         self.config = config
         if self.config.rollout.parallelism.dp_shard_size == -1:
@@ -389,6 +433,7 @@ class vLLMRolloutWorker(RolloutWorkerBase):
     @RolloutWorkerBase.register_rollout_command_handler(BuildMeshCommand)
     def build_global_mesh(self, build_mesh_command: BuildMeshCommand):
         logger.info(f"[Rollout] Building global mesh for {self.replica_name}")
+        st = time.time()
 
         replica_name_to_rank = build_mesh_command.replica_name_to_rank
         if self.replica_name not in replica_name_to_rank:
@@ -450,6 +495,8 @@ class vLLMRolloutWorker(RolloutWorkerBase):
         )
         # update the replcia_name to rank dict
         self.replica_name_to_rank = replica_name_to_rank
+        time_elapsed = time.time() - st
+        logger.info(f"Build global mesh took {time_elapsed:.3f} seconds.")
 
     def query_nccl_unique_id_from_controller(self, unique_id_key: str):
         # We don't have something like dist.barrier(), so just use while True loop to query it like synchronize.
@@ -620,6 +667,8 @@ class vLLMRolloutWorker(RolloutWorkerBase):
                 self.rollout,
                 self.consume_command,
                 self.config.train.enable_validation,
+                self.profiler,
+                self.trace_file,
             )
             self.prepare_shard_infos_for_weight_sync_insts()
 
@@ -711,7 +760,7 @@ class vLLMRolloutWorker(RolloutWorkerBase):
                 recv_ready.record()
                 with torch.cuda.stream(copy_stream):
                     recv_ready.wait()
-                    logger.debug(
+                    logger.info(
                         f"Flushing {len(pending_completions)} completions, {pending_bytes[0] // 1024 // 1024}"
                     )
                     for completion in pending_completions:
@@ -722,9 +771,11 @@ class vLLMRolloutWorker(RolloutWorkerBase):
             nccl_group_start(communicator_index)
 
             TRANSFER_GROUP_SIZE = 4
+            insts_group_id = 0
             for insts_group in self.policy_to_rollout_recv_insts:
                 # insts_group: WeightSyncInstructionsGroup -> inst collection for a full weight tensor
                 # handle inst group
+                logger.info(f"Number of insts groups = {len(self.policy_to_rollout_recv_insts)}, starts group: {insts_group_id}")
                 bytes_received, completion_fn = self.recv_weight_shard(
                     self.global_rank,
                     insts_group,
@@ -735,9 +786,13 @@ class vLLMRolloutWorker(RolloutWorkerBase):
                 pending_completions.append(completion_fn)
                 total_bytes_received += bytes_received
 
+                logger.info(f"Number of insts groups = {len(self.policy_to_rollout_recv_insts)}, ends group: {insts_group_id}, {bytes_received=}")
+                insts_group_id += 1
+
                 pending_groups += 1
                 if pending_groups == TRANSFER_GROUP_SIZE:
                     nccl_group_end(communicator_index)
+                    logger.info(f"Waiting for flush completions for group {insts_group_id}")
                     flush_completions(pending_bytes, pending_completions)
                     nccl_group_start(communicator_index)
                     pending_groups = 0
@@ -770,6 +825,8 @@ class vLLMRolloutWorker(RolloutWorkerBase):
         Broadcast the weight to all other rollout replicas.
         Will only happen between Rollout Replica 0 and all other Rollout Replicas.
         """
+        logger.info("[Rollout] broadcast to all rollout replica command called")
+        st = time.time()
         src_replica_name: str = broadcast_command.src_replica_name
         dst_replica_names: List[str] = broadcast_command.dst_replica_names
 
@@ -786,9 +843,12 @@ class vLLMRolloutWorker(RolloutWorkerBase):
                     self.rollout,
                     self.consume_command,
                     self.config.train.enable_validation,
+                    self.profiler,
+                    self.trace_file,
                 )
                 self.prepare_shard_infos_for_weight_sync_insts()
 
+        broadcast_bytes = 0
         if len(dst_replica_names) > 1:
             logger.info("Starting broadcasting of parameters to all replicas.")
             # Only do broadcast if there are more than one rollout replicas.
@@ -803,11 +863,13 @@ class vLLMRolloutWorker(RolloutWorkerBase):
                 src_rank = self.replica_name_to_rank[src_replica_name]
 
                 for parameter in self.get_underlying_model().state_dict().values():
+                    parameter_size = parameter.numel() * parameter.element_size()
+                    broadcast_bytes += parameter_size
                     recv_tensor = parameter
                     if not parameter.is_contiguous():
                         recv_tensor = parameter.contiguous()
 
-                    nccl_broadcast(recv_tensor, src_rank, self.global_commnicator_idex)
+                    nccl_broadcast(recv_tensor, src_rank, self.global_commnicator_idex, timeout_ms=1200000)
 
                     if not parameter.is_contiguous():
                         parameter.copy_(recv_tensor)
@@ -879,6 +941,8 @@ class vLLMRolloutWorker(RolloutWorkerBase):
                             f"[Rollout] Failed in post rollout completion to controller: {str(e)}"
                         )
 
+        time_elapsed = time.time() - st
+        logger.info(f"Rollout R to R broadcast took {time_elapsed:.3f} seconds with {broadcast_bytes / (1024 * 1024)} MBs")
         if broadcast_command.replica_should_stop():
             self.shutdown_signal.set()
 

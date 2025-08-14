@@ -77,6 +77,7 @@ from cosmos_rl.utils.pynccl import (
     nccl_group_end,
 )
 from cosmos_rl.utils.util import compute_logprobs as logprobs_computing
+from cosmos_rl.utils.util import log_gpu_memory, clear_gpu_memory
 
 
 def compute_loss(
@@ -579,6 +580,7 @@ class GRPOTrainer(Trainer):
     def execute_policy_to_policy_broadcast(
         self, command: PolicyToPolicyBroadcastCommand
     ):
+        logger.info("Received a Policy2Policy Broadcast command")
         send = self.replica_name == command.src_replica_name
         recv = self.replica_name in command.dst_replica_names and not send
         if not send and not recv:
@@ -596,7 +598,7 @@ class GRPOTrainer(Trainer):
         if recv:
             self.model_ready = True
         time_eclapsed = time.time() - st
-        logger.debug(
+        logger.info(
             f"[Policy] Policy2Policy Broadcast {len_params} parameters from {command.src_replica_name} (rank {self.inter_policy_nccl.get_replica_rank(command.src_replica_name)}) to {len(command.dst_replica_names)} replicas took {time_eclapsed:.3f} seconds."
         )
         return False
@@ -604,6 +606,7 @@ class GRPOTrainer(Trainer):
     @Trainer.register_policy_command_handler(PolicyToPolicyUnicastCommand)
     def execute_policy_to_policy_unicast(self, command: PolicyToPolicyUnicastCommand):
         logger.info("[Policy] Executing policy-to-policy unicast ...")
+        logger.info("Received a Policy2Policy unicast command")
         send = self.replica_name == command.src_replica_name
         recv = self.replica_name == command.dst_replica_name
         if not send and not recv:
@@ -624,7 +627,7 @@ class GRPOTrainer(Trainer):
         if recv:
             self.model_ready = True
         time_eclapsed = time.time() - st
-        logger.debug(
+        logger.info(
             f"[Policy] Policy2Policy Unicast {len_params} parameters from {command.src_replica_name} (rank {self.inter_policy_nccl.get_replica_rank(command.src_replica_name)}) to {command.dst_replica_name} (rank {self.inter_policy_nccl.get_replica_rank(command.dst_replica_name)}) as sender {send} took {time_eclapsed:.3f} seconds."
         )
         logger.info("[Policy] Executed policy-to-policy unicast.")
@@ -649,6 +652,7 @@ class GRPOTrainer(Trainer):
     @Trainer.register_policy_command_handler(PolicyToRolloutUnicastCommand)
     def execute_policy_to_rollout_unicast(self, command: PolicyToRolloutUnicastCommand):
         logger.info("[Policy] Starting policy_to_rollout_unicast ...")
+        logger.info("Received a Policy2Rollout unicast command")
         assert command.src_replica_size == self.world_size
         if not command.src_replica_name == self.replica_name:
             logger.error(
@@ -698,6 +702,7 @@ class GRPOTrainer(Trainer):
                 nccl_uuid,
                 self.global_rank,
                 self.world_size + command.dst_replica_size,
+                timeout_ms=1200000,
             )
             logger.debug(
                 f"[Policy] `P2R` nccl comm: {comm_id} for `P2R` with mesh_key: {mesh_key} is created."
@@ -802,7 +807,7 @@ class GRPOTrainer(Trainer):
 
         # make sure all the send operations of all ranks are finished
         time_eclapsed = time.time() - st
-        logger.debug(
+        logger.info(
             f"[Policy] All {len(self.policy_to_rollout_insts)} at step {command.weight_step} send operations of finished in {time_eclapsed:.3f} seconds with {total_bytes_sent / (1024 * 1024)} MB sent."
         )
         logger.info("[Policy] Finished policy_to_rollout_unicast execution.")
@@ -810,6 +815,7 @@ class GRPOTrainer(Trainer):
 
     @Trainer.register_policy_command_handler(WeightResumeCommand)
     def execute_weight_resume(self, command: WeightResumeCommand = None):
+        logger.info("Received a weight resume command")
         # If KL-divergence is enabled, hf model should always be loaded from checkpoint
         model_loaded = False
         if self.config.train.train_policy.kl_beta != 0.0:
@@ -853,6 +859,7 @@ class GRPOTrainer(Trainer):
     @Trainer.register_policy_command_handler(DataFetchCommand)
     def execute_data_fetch(self, command: DataFetchCommand):
         logger.info("[Policy] Executing data fetch.")
+        logger.info("Received a Data Fetch command")
         if command.do_profile:
             self.profiler.start_dynamic(
                 active_steps=command.active_steps,
@@ -862,11 +869,25 @@ class GRPOTrainer(Trainer):
                 with_stack=command.with_stack,
                 with_modules=command.with_modules,
             )
+        # if True:
+        #     if self.profiler.enable_profile is False:
+        #         logger.info("[Profiler] enable_profile is False!!")
+        #         self.profiler.enable_profile = True
+        #     self.profiler.start_dynamic(
+        #         active_steps=1,
+        #         rank_filter=[i for i in range(256)],
+        #         record_shape=True,
+        #         profile_memory=False,
+        #         with_stack=True,
+        #         with_modules=True,
+        #     )
+        #     logger.info(f"Profilter step = {self.profiler.profiler.step_num}, output_dir = {self.profiler.output_dir}")
 
         assert self.replica_name == command.replica_name
         self.replica_batch_for_this_step = command.items_count
 
         is_fake_step = self.replica_batch_for_this_step == 0
+        logger.info(f"Do profile = {command.do_profile}, {is_fake_step=}, current_step = {command.global_step}, total_steps = {command.total_steps}")
         if not is_fake_step:
             report_data = self.train(
                 current_step=command.global_step,
@@ -1144,6 +1165,7 @@ class GRPOTrainer(Trainer):
         self, current_step: int, total_steps: int, remain_samples_num: int
     ) -> Dict[str, Any]:
         logger.info("Starting train step.")
+        log_gpu_memory("Begin of train")
         pp_last_stage = (
             self.parallel_dims.pp_coord[0] == self.parallel_dims.pp_coord[1] - 1
         )
@@ -1213,12 +1235,15 @@ class GRPOTrainer(Trainer):
                 n_microbatches % self.parallel_dims.pp == 0
             ), f"n_microbatches {n_microbatches} should be divided evenly by pp size of {self.parallel_dims.pp}"
 
+        log_gpu_memory("Before swap")
         need_compute_ref, kl_beta = self._swap_model_state_dict()
+        log_gpu_memory("After swap")
 
         loss_sum = torch.tensor(0.0, device=self.device)
         kl_loss_sum = torch.tensor(0.0, device=self.device)
         loss_count = 0
         is_computing_refs = [True, False] if need_compute_ref else [False]
+        logger.info(f"Training metadata: {self.mu_iterations=}, {is_computing_refs=}, {batch_size=}, {mini_batch_size=}")
         for is_computing_ref in is_computing_refs:
             # Set model to eval mode if reference model is being used
             if is_computing_ref:
@@ -1404,7 +1429,9 @@ class GRPOTrainer(Trainer):
                                         else torch.tensor([-1.0], device=self.device)
                                     )
                             else:
+                                log_gpu_memory(f"Before forward {is_computing_ref=}, {i_mu=}, {i=}")
                                 raw_logits = self.model(**user_mini_batch)
+                                log_gpu_memory(f"After forward {is_computing_ref=}, {i_mu=}, {i=}")
 
                                 if self.parallel_dims.cp_enabled:
                                     # reset the position ids and input ids
@@ -1431,6 +1458,7 @@ class GRPOTrainer(Trainer):
                                         full_logits=raw_logits,
                                     )
                                 )
+                                log_gpu_memory(f"After logprobs {is_computing_ref=}, {i_mu=}, {i=}")
                                 logprob_masks = user_mini_batch["logprob_masks"]
                                 current_advantages = (
                                     logprob_masks * minibatched_advantages
@@ -1472,16 +1500,21 @@ class GRPOTrainer(Trainer):
                                         self.config,
                                         logprob_masks,
                                     )
+                                    log_gpu_memory(f"After loss {is_computing_ref=}, {i_mu=}, {i=}")
                                     if num_mini_batch > 1:
                                         loss /= num_mini_batch
                                         kl_loss /= num_mini_batch
                                     loss.backward()
+                                    log_gpu_memory(f"After backward {is_computing_ref=}, {i_mu=}, {i=}")
                                     loss_sum += loss.item()
                                     loss_count += 1
                                     kl_loss_sum += kl_loss.item()
                             self.mini_step += 1
                             local_mini_step += 1
                         self.execute_all_reduce()
+                        # log_gpu_memory("Before clear gpu memory")
+                        # clear_gpu_memory()
+                        # log_gpu_memory("After clear gpu memory")
         self.old_per_token_logps = []
         self.ref_per_token_logps = []
         end_event.record()
